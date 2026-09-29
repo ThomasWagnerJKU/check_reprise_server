@@ -1,0 +1,18 @@
+Setting license file path to 5852@licsrv
+rlmutil v16.0
+Copyright (C) 2006-2024, Reprise Software, Inc. All rights reserved.
+
+
+Error connecting to "rlm" server
+
+Connection attempted to host: "licsrv" on port 5852
+
+Connection refused at server (-111)
+Cannot connect to server (comm: -4)Connection refused (errno: 111)
+
+
+This error usually means that:
+ (1) The license server (rlm) is not running, or
+ (2) The hostname or port # in a port@host or license file is incorrect, or
+ (3) The ISV server isn't running, or
+ (4) The license server machine is down.

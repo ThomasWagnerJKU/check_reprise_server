@@ -1,0 +1,32 @@
+Setting license file path to 5852@licsrv
+rlmutil v16.0
+Copyright (C) 2006-2024, Reprise Software, Inc. All rights reserved.
+
+
+	rlm status on licsrv (port 5852), up 00:19:22
+	rlm software version v16.0 (build:1)
+	rlm comm version: v1.2
+
+	--------- ISV servers ----------
+	   Name           Port Running Restarts
+	sonnetusa         5853   Yes      0
+	otherisv          5854   Yes      0
+
+	------------------------
+
+	sonnetusa license pool status on licsrv (port 5853)
+
+	shared v19, pool: 2
+		count: 4, # reservations: 0, inuse: 1, exp: permanent
+		obsolete: 0, min_remove: 120, total checkouts: 12
+
+	------------------------
+
+	otherisv license pool status on licsrv (port 5854)
+
+	shared v3, pool: 1
+		count: 8, # reservations: 0, inuse: 2, exp: permanent
+		obsolete: 0, min_remove: 120, total checkouts: 0
+	layout v3, pool: 2
+		count: 2, # reservations: 0, inuse: 0, exp: permanent
+		obsolete: 0, min_remove: 120, total checkouts: 0

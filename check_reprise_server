@@ -1,0 +1,369 @@
+#!/usr/bin/python3
+# Nagios/Icinga plugin to check a Reprise License Manager (RLM) server with rlmutil.
+#
+# Copyright (C) 2026 Thomas Wagner <thomas.wagner@jku.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import argparse
+import datetime
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+STATE_TEXT = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+
+VERSION = "0.1"
+DEFAULT_PORT = 5053
+DEFAULT_TIMEOUT = 30
+DEFAULT_WARNING = "30:"
+DEFAULT_CRITICAL = "7:"
+MAX_LISTED = 5
+
+MONTHS = {name: number for number, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+RLM_UP_RE = re.compile(r'^\s*rlm status on (?P<host>\S+) \(port (?P<port>\d+)\), up ')
+ISV_TABLE_START_RE = re.compile(r'^\s*-+\s*ISV servers\s*-+\s*$')
+ISV_ROW_RE = re.compile(r'^\s*(?P<isv>\S+)\s+(?P<port>\d+)\s+(?P<running>Yes|No)\s+(?P<restarts>\d+)\s*$')
+POOL_STATUS_RE = re.compile(r'^\s*(?P<isv>\S+) license pool status on ')
+POOL_HEADER_RE = re.compile(r'^\t(?P<product>\S+) v(?P<version>[\w.]+), pool: (?P<pool>\d+)\s*$')
+POOL_DETAIL_RE = re.compile(
+    r'^\t+count:\s*(?P<count>\S+),\s*#\s*reservations:\s*\d+,\s*inuse:\s*(?P<inuse>\d+),\s*exp:\s*(?P<expiry>.+?)\s*$')
+DOWN_MARKER = 'Error connecting to "rlm" server'
+DATE_RE = re.compile(r'\b(?P<day>\d{1,2})-(?P<month>[a-zA-Z]{3})-(?P<year>\d{4})\b')
+
+
+class PluginError(Exception):
+    def __init__(self, state, message):
+        super().__init__(message)
+        self.state = state
+        self.message = message
+
+
+class Range:
+    """Threshold range as defined by the monitoring plugins guidelines."""
+
+    def __init__(self, start, end, inside):
+        self.start = start
+        self.end = end
+        self.inside = inside
+        self.spec = self._normalized()
+
+    def _normalized(self):
+        """Threshold as perfdata carries it: graphers want a plain number, so one-sided ranges become their bound."""
+        if not self.inside and self.start == float("-inf") and self.end == float("inf"):
+            return ""
+        if not self.inside and self.end == float("inf"):
+            return format_number(self.start)
+        if not self.inside and self.start in (0, float("-inf")) and self.end != float("inf"):
+            return format_number(self.end)
+        low = "~" if self.start == float("-inf") else format_number(self.start)
+        high = "" if self.end == float("inf") else format_number(self.end)
+        return ("@" if self.inside else "") + "%s:%s" % (low, high)
+
+    @classmethod
+    def parse(cls, spec):
+        raw = spec
+        inside = spec.startswith("@")
+        if inside:
+            spec = spec[1:]
+
+        if ":" in spec:
+            low, high = spec.split(":", 1)
+        else:
+            low, high = "0", spec
+
+        try:
+            start = float("-inf") if low in ("~", "") else float(low)
+            end = float("inf") if high == "" else float(high)
+        except ValueError:
+            raise PluginError(UNKNOWN, "invalid threshold %r" % raw)
+
+        if start > end:
+            raise PluginError(UNKNOWN, "invalid threshold %r: start is above end" % raw)
+
+        return cls(start, end, inside)
+
+    def breached(self, value):
+        within = self.start <= value <= self.end
+        return within if self.inside else not within
+
+
+def format_number(value):
+    if isinstance(value, int) or float(value).is_integer():
+        return "%d" % value
+    return ("%.3f" % value).rstrip("0").rstrip(".")
+
+
+def perfdata(label, value, uom="", warn=None, crit=None, minimum=None, maximum=None):
+    fields = [
+        warn.spec if warn else "",
+        crit.spec if crit else "",
+        "" if minimum is None else format_number(minimum),
+        "" if maximum is None else format_number(maximum),
+    ]
+    while fields and fields[-1] == "":
+        fields.pop()
+    out = "%s=%s%s" % (label, format_number(value), uom)
+    if fields:
+        out += ";" + ";".join(fields)
+    return out
+
+
+def perfdata_label(label):
+    # quotes are doubled inside a quoted label, '=' separates label and value
+    return "'" + label.replace("'", "''").replace("=", "_") + "'"
+
+
+def parse_expiry(text):
+    """
+    The expiry date of an RLM date such as 29-sep-2027, or None for a
+    license that never expires: 'permanent'.
+    """
+    if "permanent" in text.lower():
+        return None
+    match = DATE_RE.search(text)
+    if not match or match.group("month").lower() not in MONTHS:
+        raise ValueError("unknown expiry date %r" % text)
+    return datetime.date(int(match.group("year")), MONTHS[match.group("month").lower()], int(match.group("day")))
+
+
+class Status:
+    """What rlmstat reports about a license server."""
+
+    def __init__(self):
+        self.server_up = False
+        self.isv_servers = {}  # isv -> running (bool)
+        self.features = []     # dicts with feature, isv, issued, used; issued is None when uncounted
+        self.expiries = {}     # feature -> list of expiry dates, None for permanent
+
+
+def parse_rlmstat_a(text, status):
+    isv = None
+    in_isv_table = False
+    pending_product = None
+    for line in text.splitlines():
+        if RLM_UP_RE.match(line):
+            status.server_up = True
+            continue
+        if ISV_TABLE_START_RE.match(line):
+            in_isv_table = True
+            continue
+        if in_isv_table:
+            match = ISV_ROW_RE.match(line)
+            if match:
+                status.isv_servers[match.group("isv")] = match.group("running") == "Yes"
+                continue
+            if not line.strip() or line.strip().startswith("Name"):
+                continue
+            in_isv_table = False
+        match = POOL_STATUS_RE.match(line)
+        if match:
+            isv = match.group("isv")
+            pending_product = None
+            continue
+        match = POOL_HEADER_RE.match(line)
+        if match:
+            pending_product = match.group("product")
+            continue
+        match = POOL_DETAIL_RE.match(line)
+        if match and pending_product:
+            count = match.group("count")
+            try:
+                status.expiries.setdefault(pending_product, []).append(parse_expiry(match.group("expiry")))
+            except ValueError:
+                pass
+            status.features.append({
+                "feature": pending_product, "isv": isv,
+                "issued": int(count) if count.isdigit() else None,
+                "used": int(match.group("inuse")),
+            })
+            pending_product = None
+            continue
+
+
+def rlmutil_command(args):
+    return [args.rlmutil, "rlmstat", "-a", "-c", args.license]
+
+
+def run(command, args, env=None):
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                universal_newlines=True, timeout=args.timeout, env=env)
+    except subprocess.TimeoutExpired:
+        raise PluginError(CRITICAL, "no answer from %s within %ss" % (args.license, format_number(args.timeout)))
+    except OSError as err:
+        raise PluginError(UNKNOWN, "cannot run %s: %s" % (command[0], err.strerror))
+    return result.returncode, result.stdout
+
+
+def query(args):
+    """Runs rlmstat -a, locally or with --ssh on another host, and returns its output."""
+    if args.ssh:
+        remote = " ".join(shlex.quote(part) for part in rlmutil_command(args))
+        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % max(1, int(args.timeout)),
+                   args.ssh, remote]
+        returncode, output = run(command, args)
+        if returncode != 0 and DOWN_MARKER not in output:
+            lines = [line for line in output.splitlines() if line.strip()]
+            raise PluginError(UNKNOWN, "cannot run rlmutil on %s: %s" % (
+                args.ssh, lines[0] if lines else "ssh exited with %d" % returncode))
+        return output
+
+    if not os.path.isfile(args.rlmutil) or not os.access(args.rlmutil, os.X_OK):
+        raise PluginError(UNKNOWN, "%s is not an executable file" % args.rlmutil)
+    _, output = run(rlmutil_command(args), args)
+    return output
+
+
+def unique_labels(features):
+    """Perfdata labels: the feature name, prefixed with its ISV where two ISVs share a name."""
+    names = [item["feature"] for item in features]
+    return [item["feature"] if names.count(item["feature"]) == 1 else "%s/%s" % (item["isv"], item["feature"])
+            for item in features]
+
+
+def down_reason(text):
+    section = text.split(DOWN_MARKER, 1)[1]
+    section = section.split("This error usually means", 1)[0]
+    lines = [line.strip() for line in section.splitlines() if line.strip()]
+    return lines[-1] if lines else "connection failed"
+
+
+def check(args, text, today):
+    if DOWN_MARKER in text:
+        raise PluginError(CRITICAL, "license server %s is down: %s" % (args.license, down_reason(text)))
+
+    status = Status()
+    parse_rlmstat_a(text, status)
+
+    if not status.server_up:
+        reason = next((line.strip() for line in text.splitlines()
+                       if line.strip() and "Copyright" not in line and "rlmutil v" not in line), "no answer")
+        raise PluginError(CRITICAL, "license server %s is down: %s" % (args.license, reason))
+
+    state = OK
+    problems = []
+
+    down = sorted(isv for isv, running in status.isv_servers.items() if not running)
+    if down:
+        state = CRITICAL
+        problems += ["ISV server %s is down" % isv for isv in down]
+
+    if not status.features:
+        raise PluginError(UNKNOWN if not problems else CRITICAL,
+                          "; ".join(problems + ["license server %s reports no features" % args.license]))
+
+    # the earliest expiry of all features
+    dated = [(expiry, feature) for feature, expiries in status.expiries.items() for expiry in expiries if expiry]
+    days_left = None
+    expiry_text = None
+    if dated:
+        earliest, feature = min(dated)
+        days_left = (earliest - today).days
+        if args.critical and args.critical.breached(days_left):
+            expiry_state = CRITICAL
+        elif args.warning and args.warning.breached(days_left):
+            expiry_state = WARNING
+        else:
+            expiry_state = OK
+        soon = sorted({name for expiry, name in dated if expiry == earliest})
+        names = ", ".join(soon[:MAX_LISTED]) + (" and %d more" % (len(soon) - MAX_LISTED)
+                                                 if len(soon) > MAX_LISTED else "")
+        if days_left < 0:
+            expiry_text = "%s expired on %s, %d days ago" % (names, earliest.isoformat(), -days_left)
+        else:
+            expiry_text = "%s expire%s on %s, in %d days" % (names, "s" if len(soon) == 1 else "",
+                                                              earliest.isoformat(), days_left)
+        if expiry_state != OK:
+            problems.append(expiry_text)
+            state = max(state, expiry_state)
+    else:
+        expiry_text = "no feature expires"
+
+    counted = [item for item in status.features if item["issued"] is not None]
+    summary = "%d feature(s), %d of %d licenses in use" % (
+        len(status.features), sum(item["used"] for item in counted), sum(item["issued"] for item in counted))
+
+    message = ", ".join(problems) if problems else ""
+    message += (", " if message else "") + summary
+    if not problems or expiry_text not in problems:
+        message += ", " + expiry_text
+
+    perf = []
+    if days_left is not None:
+        perf.append(perfdata("days_left", days_left, "", args.warning, args.critical))
+    for label, item in zip(unique_labels(status.features), status.features):
+        if item["issued"] is not None:
+            perf.append(perfdata(perfdata_label(label), item["used"], "", minimum=0, maximum=item["issued"]))
+    return state, message, perf
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error, which Nagios reads as CRITICAL; exit UNKNOWN instead."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+        sys.exit(UNKNOWN)
+
+
+def build_parser():
+    parser = ArgumentParser(
+        prog="check_reprise_server",
+        description="Nagios/Icinga plugin to check a Reprise License Manager (RLM) server with rlmutil: the rlm "
+                    "server and its ISV servers have to be up, the usage of every product is reported as "
+                    "performance data, and the thresholds apply to the days until the earliest expiry of any "
+                    "product.",
+        epilog="Thresholds take the monitoring plugins range format; as fewer days left are worse, use lower "
+               "bounds such as the defaults -w 30: -c 7:.")
+    parser.add_argument("-V", "--version", action="version", version="check_reprise_server %s" % VERSION)
+    parser.add_argument("-l", "--rlmutil", required=True, help="path of rlmutil (on the --ssh host with --ssh)")
+    parser.add_argument("-H", "--hostname", required=True, help="license server")
+    parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
+                        help="port of rlm (default: %d)" % DEFAULT_PORT)
+    parser.add_argument("-w", "--warning", default=DEFAULT_WARNING,
+                        help="warning range for the days until the earliest expiry (default: %s)" % DEFAULT_WARNING)
+    parser.add_argument("-c", "--critical", default=DEFAULT_CRITICAL,
+                        help="critical range for the days until the earliest expiry (default: %s)"
+                             % DEFAULT_CRITICAL)
+    parser.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help="timeout in seconds for the rlmutil call (default: %d)" % DEFAULT_TIMEOUT)
+    parser.add_argument("-s", "--ssh", metavar="[USER@]HOST",
+                        help="run rlmutil on this host via ssh, typically the license server itself; -H is then "
+                             "resolved there, so -H localhost checks the server the ssh connection goes to")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    args.license = "%d@%s" % (args.port, args.hostname)
+
+    try:
+        args.warning = Range.parse(args.warning) if args.warning else None
+        args.critical = Range.parse(args.critical) if args.critical else None
+        text = query(args)
+        state, message, perf = check(args, text, datetime.date.today())
+    except PluginError as err:
+        print("RLM %s - %s" % (STATE_TEXT[err.state], err.message))
+        return err.state
+
+    output = "RLM %s - %s" % (STATE_TEXT[state], message)
+    if perf:
+        output += " | " + " ".join(perf)
+    print(output)
+    return state
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(UNKNOWN)

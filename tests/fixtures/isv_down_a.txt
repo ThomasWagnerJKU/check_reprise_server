@@ -1,0 +1,22 @@
+Setting license file path to 5852@licsrv
+rlmutil v16.0
+Copyright (C) 2006-2024, Reprise Software, Inc. All rights reserved.
+
+
+	rlm status on licsrv (port 5852), up 00:19:22
+	rlm software version v16.0 (build:1)
+	rlm comm version: v1.2
+	Startup time: Tue Sep 29 16:49:48 2026
+	Todays Statistics (00:19:21), init time: Tue Sep 29 16:49:49 2026
+	Recent Statistics (00:19:21), init time: Tue Sep 29 16:49:49 2026
+
+	             Recent Stats         Todays Stats         Total Stats
+	              00:19:21             00:19:21             00:19:22
+	Messages:    2 (0/sec)           2 (0/sec)          2 (0/sec)
+	Connections: 1 (0/sec)           1 (0/sec)          1 (0/sec)
+
+	--------- ISV servers ----------
+	   Name           Port Running Restarts
+	sonnetusa         5853   No       3
+
+	------------------------
