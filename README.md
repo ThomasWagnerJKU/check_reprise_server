@@ -84,6 +84,16 @@ RLM's protocol between rlmutil and rlm is proprietary, so the plugin needs
 - **Liveness only**: `check_tcp` against the rlm port and the ISV server
   port tells whether the daemons listen, but not their usage or expiry.
 
+## Bash completion
+
+`completions/check_reprise_server` completes the options and their values,
+also when the plugin is called by its full path. The packages install it;
+otherwise copy it to bash-completion's directory:
+
+```sh
+install -D -m 0644 completions/check_reprise_server /usr/share/bash-completion/completions/check_reprise_server
+```
+
 ## Tests
 
 ```sh
